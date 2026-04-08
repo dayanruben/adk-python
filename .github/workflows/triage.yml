@@ -6,6 +6,7 @@ on:
   schedule:
     # Run every 6 hours to triage untriaged issues
     - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 jobs:
   agent-triage-issues:
@@ -17,7 +18,8 @@ jobs:
     if: >-
       github.repository == 'google/adk-python' && (
         github.event_name == 'schedule' ||
-        github.event.action == 'opened'
+        github.event.action == 'opened' ||
+        github.event_name == 'workflow_dispatch'
       )
     permissions:
       issues: write

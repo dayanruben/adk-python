@@ -12,5 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# version: major.minor.patch
-__version__ = "1.30.0"
+from .gcp_auth_provider import GcpAuthProvider
+from .gcp_auth_provider_scheme import GcpAuthProviderScheme
+
+__all__ = [
+    "GcpAuthProvider",
+    "GcpAuthProviderScheme",
+]

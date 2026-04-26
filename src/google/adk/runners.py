@@ -646,12 +646,6 @@ class Runner:
         session_id=session_id,
         get_session_config=run_config.get_session_config,
     )
-    if not rewind_before_invocation_id:
-      # Guard against matching the synthetic initial-state event that is
-      # appended by `create_session`; that event has an empty invocation_id by
-      # design and is not a valid rewind target.
-      raise ValueError('rewind_before_invocation_id must be non-empty.')
-
     rewind_event_index = -1
     for i, event in enumerate(session.events):
       if event.invocation_id == rewind_before_invocation_id:
@@ -692,34 +686,16 @@ class Runner:
       self, session: Session, rewind_event_index: int
   ) -> dict[str, Any]:
     """Computes the state delta to reverse changes."""
-    # State at the rewind point is reconstructed entirely from the event
-    # stream. Session-scoped initial state from `create_session` is captured
-    # as a synthetic event by `BaseSessionService._record_initial_state_event`,
-    # so walking events naturally restores initial values even when a later
-    # event overwrote them.
     state_at_rewind_point: dict[str, Any] = {}
-    all_event_keys: set[str] = set()
-
-    for event in session.events[:rewind_event_index]:
-      if not event.actions.state_delta:
-        continue
-      for k, v in event.actions.state_delta.items():
-        if k.startswith('app:') or k.startswith('user:'):
-          continue
-        all_event_keys.add(k)
-        if v is None:
-          state_at_rewind_point.pop(k, None)
-        else:
-          state_at_rewind_point[k] = v
-
-    # Collect any other keys touched by events after the rewind point so we
-    # know which keys were ever event-sourced.
-    for event in session.events[rewind_event_index:]:
-      if not event.actions.state_delta:
-        continue
-      for k in event.actions.state_delta:
-        if not k.startswith('app:') and not k.startswith('user:'):
-          all_event_keys.add(k)
+    for i in range(rewind_event_index):
+      if session.events[i].actions.state_delta:
+        for k, v in session.events[i].actions.state_delta.items():
+          if k.startswith('app:') or k.startswith('user:'):
+            continue
+          if v is None:
+            state_at_rewind_point.pop(k, None)
+          else:
+            state_at_rewind_point[k] = v
 
     current_state = session.state
     rewind_state_delta = {}
@@ -730,13 +706,12 @@ class Runner:
         rewind_state_delta[key] = value_at_rewind
 
     # 2. Set keys to None in rewind_state_delta if they are in current_state
-    #    but not in state_at_rewind_point. Only nullify keys that were
-    #    introduced or modified through events; keys set outside the event
-    #    stream are preserved.
+    #    but not in state_at_rewind_point. These keys were added after the
+    #    rewind point and need to be removed.
     for key in current_state:
       if key.startswith('app:') or key.startswith('user:'):
         continue
-      if key not in state_at_rewind_point and key in all_event_keys:
+      if key not in state_at_rewind_point:
         rewind_state_delta[key] = None
 
     return rewind_state_delta

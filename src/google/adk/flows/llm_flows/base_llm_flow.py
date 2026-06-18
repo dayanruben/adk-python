@@ -555,9 +555,18 @@ class BaseLlmFlow(ABC):
         # initial_history_in_client_content to True. This tells the Live server
         # that the provided history already includes the model's past responses,
         # preventing the server from generating duplicate responses for those replayed turns.
+        #
+        # ``history_config`` is only supported by the Gemini Developer API
+        # backend; the Vertex AI / Gemini Enterprise Agent Platform backend has
+        # no such field on its live setup message and rejects it. On Vertex,
+        # history is instead seeded by ``send_history`` below
+        # (``send_client_content`` with prior turns), so we skip
+        # ``history_config`` for that backend.
         if (
             llm_request.contents
             and not invocation_context.live_session_resumption_handle
+            and isinstance(llm, Gemini)
+            and llm._api_backend == GoogleLLMVariant.GEMINI_API  # pylint: disable=protected-access
         ):
           if not llm_request.live_connect_config:
             llm_request.live_connect_config = types.LiveConnectConfig()
@@ -704,9 +713,9 @@ class BaseLlmFlow(ABC):
         logger.error('Connection closed: %s.', e)
         raise
       except errors.APIError as e:
-        # Error code 1000 and 1006 indicates a recoverable connection drop.
+        # Error code 1000, 1006 and 1011 indicates a recoverable connection drop.
         # In that case, we attempt to reconnect with session handle if available.
-        if e.code in [1000, 1006]:
+        if e.code in [1000, 1006, 1011]:
           if invocation_context.live_session_resumption_handle:
             if attempt > DEFAULT_MAX_RECONNECT_ATTEMPTS:
               logger.error('Max reconnection attempts reached (%s).', e)
@@ -715,6 +724,7 @@ class BaseLlmFlow(ABC):
                 'Connection lost (%s), reconnecting with session handle.', e
             )
             continue
+
         logger.error('APIError in live flow: %s', e)
         raise
       except Exception as e:

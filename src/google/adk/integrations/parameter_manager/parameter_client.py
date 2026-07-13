@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import json
-from typing import cast
 from typing import Optional
 
 from google.api_core.gapic_v1 import client_info
@@ -25,7 +24,7 @@ from google.oauth2 import credentials as user_credentials
 from google.oauth2 import service_account
 
 from ... import version
-from ...utils import _mtls_utils
+from ...utils._mtls_utils import get_api_endpoint
 
 USER_AGENT = f"google-adk/{version.__version__}"
 
@@ -112,7 +111,7 @@ class ParameterManagerClient:
     client_options = None
     if location:
       client_options = {
-          "api_endpoint": _mtls_utils.get_api_endpoint(
+          "api_endpoint": get_api_endpoint(
               location,
               _DEFAULT_REGIONAL_ENDPOINT_TEMPLATE,
               _DEFAULT_MTLS_REGIONAL_ENDPOINT_TEMPLATE,
@@ -145,4 +144,4 @@ class ParameterManagerClient:
         name=resource_name
     )
     response = self._client.render_parameter_version(request=request)
-    return cast(str, response.rendered_payload.decode("UTF-8"))
+    return response.rendered_payload.decode("UTF-8")

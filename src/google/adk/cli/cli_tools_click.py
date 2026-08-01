@@ -29,6 +29,7 @@ import tempfile
 import textwrap
 import time
 from typing import Any
+from typing import AsyncIterator
 from typing import cast
 from typing import Optional
 from typing import TYPE_CHECKING
@@ -281,6 +282,7 @@ class TelemetryGroup(click.Group):
 
   def invoke(self, ctx: click.Context) -> Any:
     start_time = time.monotonic()
+    ctx.meta["telemetry_start_time"] = start_time
     exit_code = 0
     exception_type = ""
     try:
@@ -301,6 +303,7 @@ class TelemetryGroup(click.Group):
           ctx.invoked_subcommand is not None
           and ctx.invoked_subcommand != "telemetry"
           and not any(arg in full_args for arg in ("--help", "-h"))
+          and not ctx.meta.get("telemetry_recorded")
       ):
         try:
           resolved = []
@@ -1193,7 +1196,7 @@ def cli_eval(
     from ..evaluation.simulation.user_simulator_provider import UserSimulatorProvider
     from .cli_eval import _collect_eval_results
     from .cli_eval import _collect_inferences
-    from .cli_eval import get_root_agent
+    from .cli_eval import get_app_or_root_agent
     from .cli_eval import parse_and_get_evals_to_run
     from .cli_eval import pretty_print_eval_result
   except ModuleNotFoundError as mnf:
@@ -1213,7 +1216,7 @@ def cli_eval(
   else:
     inference_config = InferenceConfig(use_live=False)
 
-  root_agent = asyncio.run(get_root_agent(agent_module_file_path))
+  app, root_agent = asyncio.run(get_app_or_root_agent(agent_module_file_path))
   app_name = os.path.basename(agent_module_file_path)
   agents_dir = os.path.dirname(agent_module_file_path)
   eval_sets_manager = None
@@ -1305,6 +1308,7 @@ def cli_eval(
         eval_set_results_manager=eval_set_results_manager,
         user_simulator_provider=user_simulator_provider,
         metric_evaluator_registry=metric_evaluator_registry,
+        app=app,
     )
 
     inference_results = asyncio.run(
@@ -1986,6 +1990,7 @@ def cli_web(
   """
   reload = _check_windows_reload(reload)
   logs.setup_adk_logger(getattr(logging, log_level.upper()))
+  ctx = click.get_current_context(silent=True)
 
   @asynccontextmanager
   async def _lifespan(app: FastAPI):
@@ -1999,6 +2004,24 @@ def cli_web(
 """,
         fg="green",
     )
+    try:
+      if (
+          ctx
+          and read_telemetry_consent() is True
+          and not ctx.meta.get("telemetry_recorded")
+      ):
+        start_time = ctx.meta.get("telemetry_start_time", time.monotonic())
+        collector = MetricsCollector()
+        collector.record_command_run(
+            command="web",
+            exit_code=0,
+            duration_ms=int((time.monotonic() - start_time) * 1000),
+            exception_type="",
+        )
+        ctx.meta["telemetry_recorded"] = True
+    except Exception:  # pylint: disable=broad-except
+      # Failsafe: telemetry errors must never crash the CLI
+      pass
     yield  # Startup is done, now app is running
     click.secho(
         """
@@ -2139,10 +2162,35 @@ def cli_api_server(
     )
 
   logs.setup_adk_logger(getattr(logging, log_level.upper()))
+  ctx = click.get_current_context(silent=True)
+
+  from contextlib import asynccontextmanager
 
   import uvicorn
 
   from .fast_api import get_fast_api_app
+
+  @asynccontextmanager
+  async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    try:
+      if (
+          ctx
+          and read_telemetry_consent() is True
+          and not ctx.meta.get("telemetry_recorded")
+      ):
+        start_time = ctx.meta.get("telemetry_start_time", time.monotonic())
+        collector = MetricsCollector()
+        collector.record_command_run(
+            command="api_server",
+            exit_code=0,
+            duration_ms=int((time.monotonic() - start_time) * 1000),
+            exception_type="",
+        )
+        ctx.meta["telemetry_recorded"] = True
+    except Exception:  # pylint: disable=broad-except
+      # Failsafe: telemetry errors must never crash the CLI
+      pass
+    yield
 
   config = uvicorn.Config(
       get_fast_api_app(
@@ -2166,6 +2214,7 @@ def cli_api_server(
           trigger_sources=trigger_sources,
           gemini_enterprise_app_name=gemini_enterprise_app_name,
           express_mode=express_mode,
+          lifespan=_lifespan,
       ),
       host=host,
       port=port,

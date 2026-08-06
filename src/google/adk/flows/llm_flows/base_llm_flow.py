@@ -591,10 +591,15 @@ class BaseLlmFlow(ABC):
     llm_request.model = agent.canonical_live_model.model
 
     llm = self.__get_llm(invocation_context)
+    # Only log non-sensitive request metadata. The full request carries the
+    # user conversation and http_options.headers, which may hold credentials.
     logger.debug(
-        'Establishing live connection for agent: %s with llm request: %s',
+        'Establishing live connection for agent: %s, model: %s, contents: %s,'
+        ' response modalities: %s',
         agent.name,
-        llm_request,
+        llm_request.model,
+        len(llm_request.contents),
+        llm_request.live_connect_config.response_modalities,
     )
 
     attempt = 1
@@ -1455,6 +1460,11 @@ class BaseLlmFlow(ABC):
         # Calls the LLM.
         llm = self.__get_llm(invocation_context)
 
+        # Check if we can make this llm call or not. If the current
+        # call pushes the counter beyond the max set value, then the
+        # execution is stopped right here, and exception is thrown.
+        invocation_context.increment_llm_call_count()
+
         responses_generator: AsyncGenerator[Any, None]
         if run_config.support_cfc:
           invocation_context.live_request_queue = LiveRequestQueue()
@@ -1490,10 +1500,6 @@ class BaseLlmFlow(ABC):
                 assert queue is not None
                 queue.close()
         else:
-          # Check if we can make this llm call or not. If the current
-          # call pushes the counter beyond the max set value, then the
-          # execution is stopped right here, and exception is thrown.
-          invocation_context.increment_llm_call_count()
           responses_generator = llm.generate_content_async(
               llm_request,
               stream=run_config.streaming_mode == StreamingMode.SSE,

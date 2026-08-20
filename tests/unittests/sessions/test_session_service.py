@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from datetime import timezone
 import enum
+import inspect
 import os
 import sqlite3
 import time
@@ -28,8 +29,6 @@ from google.adk.errors.already_exists_error import AlreadyExistsError
 from google.adk.errors.session_not_found_error import SessionNotFoundError
 from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
-from google.adk.features import FeatureName
-from google.adk.features import override_feature_enabled
 from google.adk.sessions import database_session_service
 from google.adk.sessions.base_session_service import GetSessionConfig
 from google.adk.sessions.database_session_service import DatabaseSessionService
@@ -50,10 +49,14 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
+# Tests below that take `session_service` run once per backend registered in
+# _conformance; each states a behavior every backend owes its callers.
+from . import _conformance
+from ._conformance import session_service  # noqa: F401
+
 
 class SessionServiceType(enum.Enum):
   IN_MEMORY = 'IN_MEMORY'
-  IN_MEMORY_WITH_LIGHT_COPY_ENABLED = 'IN_MEMORY_WITH_LIGHT_COPY_ENABLED'
   DATABASE = 'DATABASE'
   SQLITE = 'SQLITE'
 
@@ -67,33 +70,23 @@ def get_session_service(
     return DatabaseSessionService('sqlite+aiosqlite:///:memory:')
   if service_type == SessionServiceType.SQLITE:
     return SqliteSessionService(str(tmp_path / 'sqlite.db'))
-  if service_type == SessionServiceType.IN_MEMORY_WITH_LIGHT_COPY_ENABLED:
-    return InMemorySessionService()
   return InMemorySessionService()
 
 
-@pytest.fixture(
-    params=[
-        SessionServiceType.IN_MEMORY,
-        SessionServiceType.IN_MEMORY_WITH_LIGHT_COPY_ENABLED,
-        SessionServiceType.DATABASE,
-        SessionServiceType.SQLITE,
-    ]
-)
-async def session_service(request, tmp_path):
-  """Provides a session service and closes database backends on teardown."""
-  if request.param == SessionServiceType.IN_MEMORY_WITH_LIGHT_COPY_ENABLED:
-    override_feature_enabled(
-        FeatureName.IN_MEMORY_SESSION_SERVICE_LIGHT_COPY, True
-    )
-  service = get_session_service(request.param, tmp_path)
-  yield service
-  if isinstance(service, DatabaseSessionService):
-    await service.close()
-  if request.param == SessionServiceType.IN_MEMORY_WITH_LIGHT_COPY_ENABLED:
-    override_feature_enabled(
-        FeatureName.IN_MEMORY_SESSION_SERVICE_LIGHT_COPY, False
-    )
+def test_recorded_divergences_name_a_contract_test():
+  """A divergence keyed on anything else silently excuses no backend."""
+  for backend in _conformance.BACKENDS:
+    for test_name in backend.divergences:
+      test_function = globals().get(test_name)
+      assert test_function is not None, (
+          f'{backend.name} records a divergence for {test_name}, which is not'
+          ' a test in this module'
+      )
+      parameters = inspect.signature(test_function).parameters
+      assert 'session_service' in parameters, (
+          f'{backend.name} records a divergence for {test_name}, which does'
+          ' not take the shared contract fixture'
+      )
 
 
 def test_database_session_service_enables_pool_pre_ping_by_default():
@@ -882,6 +875,41 @@ async def test_append_event_with_requested_tool_confirmations(session_service):
       'resource_id': 'album_1',
   }
   assert not tc.confirmed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'service_type',
+    [SessionServiceType.DATABASE, SessionServiceType.SQLITE],
+)
+async def test_append_event_with_non_serializable_state_delta(
+    service_type, tmp_path
+):
+  """A value the JSON encoder rejects must not destroy the whole event."""
+  session_service = get_session_service(service_type, tmp_path)
+  app_name = 'my_app'
+  user_id = 'user'
+
+  session = await session_service.create_session(
+      app_name=app_name, user_id=user_id
+  )
+  event = Event(
+      invocation_id='invocation',
+      author='user',
+      actions=EventActions(state_delta={'callback': lambda: 1, 'ok': 2}),
+  )
+  await session_service.append_event(session=session, event=event)
+
+  refreshed_session = await session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id=session.id
+  )
+  assert refreshed_session is not None
+  assert len(refreshed_session.events) == 1
+  assert refreshed_session.state['ok'] == 2
+  assert isinstance(refreshed_session.state['callback'], str)
+
+  if isinstance(session_service, DatabaseSessionService):
+    await session_service.close()
 
 
 @pytest.mark.asyncio

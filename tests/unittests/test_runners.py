@@ -21,6 +21,7 @@ import sys
 import textwrap
 from typing import AsyncGenerator
 from typing import Optional
+from unittest import mock
 from unittest.mock import AsyncMock
 from unittest.mock import create_autospec
 from unittest.mock import patch
@@ -43,6 +44,7 @@ from google.adk.errors.session_not_found_error import SessionNotFoundError
 from google.adk.events.event import Event
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.runners import Runner
+from google.adk.sessions.base_session_service import BaseSessionService
 from google.adk.sessions.base_session_service import GetSessionConfig
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.sessions.session import Session
@@ -3130,39 +3132,6 @@ async def test_run_node_restores_branch_on_function_response_resume():
   assert model_events[0].branch == "node_agent@1"
 
 
-def test_strip_run_ids_from_path():
-  """Static path stripping removes @run_id from every segment."""
-  assert runners._strip_run_ids_from_path("") == ""
-  assert runners._strip_run_ids_from_path("A") == "A"
-  assert runners._strip_run_ids_from_path("wf/A/B") == "wf/A/B"
-  assert runners._strip_run_ids_from_path("wf/A@1/B@2") == "wf/A/B"
-
-
-def test_find_static_node_path_disambiguates_same_name_nodes():
-  """Two sub-agents sharing a name resolve to distinct static paths."""
-  coordinator = MockLlmAgent("coordinator")
-  team_a = MockLlmAgent("team_a", parent_agent=coordinator)
-  team_b = MockLlmAgent("team_b", parent_agent=coordinator)
-  worker_a = MockLlmAgent("worker", parent_agent=team_a)
-  worker_b = MockLlmAgent("worker", parent_agent=team_b)
-  team_a.sub_agents = [worker_a]
-  team_b.sub_agents = [worker_b]
-  coordinator.sub_agents = [team_a, team_b]
-
-  assert (
-      runners._find_static_node_path(coordinator, worker_a)
-      == "coordinator/team_a/worker"
-  )
-  assert (
-      runners._find_static_node_path(coordinator, worker_b)
-      == "coordinator/team_b/worker"
-  )
-  # A node that is not in the tree has no path.
-  assert (
-      runners._find_static_node_path(coordinator, MockLlmAgent("nope")) is None
-  )
-
-
 @pytest.mark.asyncio
 async def test_resumed_invocation_ignores_branch_from_other_invocation():
   """Invocation-scoping: a resumed sub-agent does not inherit a stale branch.
@@ -3388,36 +3357,6 @@ async def test_run_live_restores_branch_for_non_root_agent():
   assert event.branch == "worker@1"
 
 
-def test_is_tool_branch_excludes_agent_tool_sub_branch():
-  """Only a tool's own message branch is a tool branch.
-
-  `AgentTool` scopes a real sub-agent with
-  `_BranchPath.create_sub_branch(base, name=agent.name,
-  run_id=function_call_id)`
-  (`agent_tool.py`), so a function call id in the leaf is not enough on its own:
-  a leaf naming the node itself is that node's branch and must be kept.
-  """
-  call_ids = {"fc-1"}
-
-  # A tool's user-facing message: the leaf names the tool, not the node.
-  assert runners._is_tool_branch("do@fc-1", "worker", call_ids) is True
-  assert (
-      runners._is_tool_branch("coordinator.do@fc-1", "worker", call_ids) is True
-  )
-
-  # An AgentTool sub-agent branch: the leaf names the node itself.
-  assert (
-      runners._is_tool_branch("coordinator.worker@fc-1", "worker", call_ids)
-      is False
-  )
-  assert runners._is_tool_branch("worker@fc-1", "worker", call_ids) is False
-
-  # An ordinary node branch carries a run id, not a function call id.
-  assert runners._is_tool_branch("worker@1", "worker", call_ids) is False
-  assert runners._is_tool_branch("worker", "worker", call_ids) is False
-  assert runners._is_tool_branch("", "worker", call_ids) is False
-
-
 @pytest.mark.asyncio
 async def test_restore_keeps_sub_branch_keyed_by_function_call_id():
   """A sub-agent branch keyed by a function call id is restored, not skipped."""
@@ -3471,6 +3410,182 @@ async def test_restore_keeps_sub_branch_keyed_by_function_call_id():
   )
   assert ic.agent == sub_agent
   assert ic.branch == "coordinator.worker@fc-1"
+
+
+@pytest.mark.asyncio
+async def test_run_async_with_mock_session_service_does_not_corrupt_branch():
+  """A mock session service returning a Mock from append_event does not corrupt ic.branch."""
+  mock_session_service = mock.AsyncMock(spec=BaseSessionService)
+  mock_session = Session(
+      id="session_1", app_name="test_app", user_id="user_1", events=[], state={}
+  )
+  mock_session_service.create_session.return_value = mock_session
+  mock_session_service.get_session.return_value = mock_session
+
+  root_agent = MockLlmAgent("coordinator")
+  runner = Runner(
+      app_name="test_app",
+      agent=root_agent,
+      session_service=mock_session_service,
+  )
+
+  events = []
+  async for event in runner.run_async(
+      user_id="user_1",
+      session_id="session_1",
+      new_message=types.Content(parts=[types.Part.from_text(text="hello")]),
+  ):
+    events.append(event)
+
+  assert len(events) == 1
+  assert events[0].branch is None
+
+
+@pytest.mark.asyncio
+async def test_resume_finds_user_message_whose_text_is_not_the_first_part():
+  """A multimodal user turn can be resumed even when text is not `parts[0]`.
+
+  A user who attaches an image and then asks about it produces
+  `[image, text]`. Matching only `parts[0].text` misses that message, and the
+  resume path turns "not found" into a hard error.
+  """
+  session_service = InMemorySessionService()
+  root_agent = MockLlmAgent("coordinator")
+  app = App(
+      name="test_app",
+      root_agent=root_agent,
+      resumability_config=ResumabilityConfig(is_resumable=True),
+  )
+  runner = Runner(app=app, session_service=session_service)
+  session = await session_service.create_session(
+      app_name="test_app", user_id="user_1", session_id="session_1"
+  )
+  await session_service.append_event(
+      session,
+      Event(
+          invocation_id="inv_1",
+          author="user",
+          content=types.Content(
+              role="user",
+              parts=[
+                  types.Part(
+                      inline_data=types.Blob(
+                          mime_type="image/png", data=b"\x89PNG"
+                      )
+                  ),
+                  types.Part(text="what is in this picture?"),
+              ],
+          ),
+      ),
+  )
+
+  ic = await runner._setup_context_for_resumed_invocation(
+      session=session,
+      new_message=None,
+      invocation_id="inv_1",
+      run_config=RunConfig(),
+      state_delta=None,
+  )
+
+  assert ic.user_content is not None
+  assert ic.user_content.parts[1].text == "what is in this picture?"
+
+
+def test_find_user_message_for_invocation_requires_some_text():
+  """A message with no text at all is still not treated as the user message."""
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app=App(name="test_app", root_agent=MockLlmAgent("coordinator")),
+      session_service=session_service,
+  )
+  image_only = Event(
+      invocation_id="inv_1",
+      author="user",
+      content=types.Content(
+          role="user",
+          parts=[
+              types.Part(
+                  inline_data=types.Blob(mime_type="image/png", data=b"\x89PNG")
+              )
+          ],
+      ),
+  )
+  assert runner._find_user_message_for_invocation([image_only], "inv_1") is None
+
+
+def _fc_part(name: str, call_id: str) -> types.Part:
+  return types.Part(
+      function_call=types.FunctionCall(name=name, id=call_id, args={})
+  )
+
+
+def _fr_part(name: str, call_id: str) -> types.Part:
+  return types.Part(
+      function_response=types.FunctionResponse(
+          name=name, id=call_id, response={}
+      )
+  )
+
+
+@pytest.mark.asyncio
+async def test_resolve_invocation_id_rejects_responses_from_two_invocations():
+  """Every response is checked, not just the first one.
+
+  A message answering several calls at once must resolve to a single
+  invocation. Inspecting only `function_responses[0]` would attribute the
+  remaining responses to whichever invocation happened to come first.
+  """
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app=App(name="test_app", root_agent=MockLlmAgent("root")),
+      session_service=session_service,
+  )
+  session = await session_service.create_session(
+      app_name="test_app", user_id="u", session_id="s"
+  )
+  for inv, call_id in (("inv_a", "fc-a"), ("inv_b", "fc-b")):
+    await session_service.append_event(
+        session,
+        Event(
+            invocation_id=inv,
+            author="root",
+            content=types.Content(parts=[_fc_part("t", call_id)]),
+        ),
+    )
+
+  both = types.Content(
+      role="user", parts=[_fr_part("t", "fc-a"), _fr_part("t", "fc-b")]
+  )
+  with pytest.raises(ValueError, match="resolve to multiple invocations"):
+    runner._resolve_invocation_id(session, both, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_invocation_id_accepts_responses_from_one_invocation():
+  """Several responses to calls from the same invocation still resolve."""
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app=App(name="test_app", root_agent=MockLlmAgent("root")),
+      session_service=session_service,
+  )
+  session = await session_service.create_session(
+      app_name="test_app", user_id="u", session_id="s"
+  )
+  await session_service.append_event(
+      session,
+      Event(
+          invocation_id="inv_a",
+          author="root",
+          content=types.Content(
+              parts=[_fc_part("t", "fc-a"), _fc_part("t", "fc-b")]
+          ),
+      ),
+  )
+
+  both = types.Content(
+      role="user", parts=[_fr_part("t", "fc-a"), _fr_part("t", "fc-b")]
+  )
+  assert runner._resolve_invocation_id(session, both, None) == "inv_a"
 
 
 if __name__ == "__main__":

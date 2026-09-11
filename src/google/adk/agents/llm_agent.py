@@ -57,7 +57,6 @@ from ..utils._schema_utils import SchemaType
 from ..utils._schema_utils import validate_schema
 from ..utils.context_utils import Aclosing
 from ..utils.instructions_utils import InstructionProvider as InstructionProvider
-from ..workflow._base_node import BaseNode
 from .base_agent import BaseAgent
 from .base_agent import BaseAgentState
 from .base_agent_config import BaseAgentConfig as BaseAgentConfig
@@ -129,7 +128,7 @@ OnToolErrorCallback: TypeAlias = Union[
     list[_SingleOnToolErrorCallback],
 ]
 
-ToolUnion: TypeAlias = Union[Callable, BaseTool, BaseToolset, BaseNode]  # type: ignore[type-arg]
+ToolUnion: TypeAlias = Union[Callable, BaseTool, BaseToolset]  # type: ignore[type-arg]
 
 
 async def _convert_tool_union_to_tools(
@@ -170,6 +169,7 @@ async def _convert_tool_union_to_tools(
               max_results=vais_tool.max_results,
           )
       ]
+  from ..workflow._base_node import BaseNode
 
   if isinstance(tool_union, BaseNode):
     from ..tools._node_tool import NodeTool
@@ -1228,8 +1228,8 @@ class LlmAgent(BaseAgent, abc.ABC):
   def _pre_validate_tools(cls, data: Any) -> Any:
     if isinstance(data, dict) and 'tools' in data and data['tools']:
       from google.adk.agents.base_agent import BaseAgent
+      from google.adk.tools._node_tool import NodeTool
       from google.adk.workflow._base_node import BaseNode
-      from google.adk.workflow._function_node import FunctionNode
 
       new_tools = []
       for t in data['tools']:
@@ -1239,15 +1239,7 @@ class LlmAgent(BaseAgent, abc.ABC):
               ' should be invoked as sub-agents.'
           )
         elif isinstance(t, BaseNode):
-          if not isinstance(t, FunctionNode) and not getattr(
-              t, 'input_schema', None
-          ):
-            raise ValueError(
-                f"Node '{t.name}' does not have an input_schema defined."
-                ' NodeTool requires an explicit Pydantic input_schema on the'
-                ' wrapped node.'
-            )
-          new_tools.append(t)
+          new_tools.append(NodeTool(node=t, description=t.description))
         else:
           new_tools.append(t)
       data['tools'] = new_tools

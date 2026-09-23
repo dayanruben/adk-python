@@ -14,13 +14,15 @@
 
 from __future__ import annotations
 
-import warnings
+from .not_found_error import NotFoundError
 
-from google.adk.integrations.bigquery._bigquery_skill import *
 
-warnings.warn(
-    "google.adk.tools.bigquery.bigquery_skill is moved to"
-    " google.adk.integrations.bigquery",
-    DeprecationWarning,
-    stacklevel=2,
-)
+class InvocationNotFoundError(NotFoundError, ValueError):
+  """Raised when an invocation id cannot be found in the session's events.
+
+  Also inherits from ValueError for backward compatibility with callers that
+  catch the ValueError previously raised by rewind.
+  """
+
+  def __init__(self, message: str = "Invocation ID not found.") -> None:
+    super().__init__(message)

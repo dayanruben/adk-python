@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import aclosing
+import contextvars
 import inspect
 import logging
 from pathlib import Path
@@ -978,7 +979,10 @@ class Runner:
       finally:
         event_queue.put(None)
 
-    thread = create_thread(target=_asyncio_thread_main)
+    # A new thread starts with empty contextvars. Run it in a copy of the
+    # caller's so the invocation joins the caller's OpenTelemetry trace instead
+    # of starting a disconnected one.
+    thread = create_thread(contextvars.copy_context().run, _asyncio_thread_main)
     thread.start()
 
     exhausted = False
@@ -1284,7 +1288,12 @@ class Runner:
       rewind_before_invocation_id: str,
       run_config: Optional[RunConfig] = None,
   ) -> None:
-    """Rewinds the session to before the specified invocation."""
+    """Rewinds the session to before the specified invocation.
+
+    Raises:
+      InvocationNotFoundError: If rewind_before_invocation_id does not match
+        any event in the session.
+    """
     run_config = run_config or RunConfig()
     session = await self._get_or_create_session(
         user_id=user_id,

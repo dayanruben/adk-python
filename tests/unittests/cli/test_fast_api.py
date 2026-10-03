@@ -748,6 +748,46 @@ def test_api_server_get_runner_async_rejects_internal_special_agent_name(
   )
 
 
+@pytest.mark.parametrize(
+    ("web", "bind_host", "expected"),
+    [
+        (True, "127.0.0.1", True),
+        (True, "localhost", True),
+        (True, "::1", True),
+        (True, "0.0.0.0", False),
+        (True, "::", False),
+        (True, "192.168.1.10", False),
+        (True, None, False),
+        (False, "127.0.0.1", False),
+    ],
+)
+def test_special_agents_allowed_only_on_loopback_web_server(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+    web,
+    bind_host,
+    expected,
+):
+  # The agent builder assistant writes files the server imports, and the dev
+  # server is unauthenticated, so it must not be reachable off the machine.
+  _create_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+      web=web,
+      bind_host=bind_host,
+  )
+
+  assert mock_agent_loader._allow_special_agents is expected
+
+
 @pytest.fixture
 def test_app(
     mock_session_service,
@@ -1985,6 +2025,45 @@ def test_list_sessions(test_app, create_test_session):
   logger.info(f"Listed {len(data)} sessions")
 
 
+async def test_list_sessions_filters_eval_sessions(
+    test_app, test_session_info, mock_session_service
+):
+  """Test that eval sessions (both old and new prefixes) are filtered from list."""
+  # Create a normal session
+  await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id="normal-session",
+      state={},
+  )
+  # Create a new style eval session
+  await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id="adk-eval-session-new-style",
+      state={},
+  )
+  # Create an old style eval session
+  await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id="___eval___session___old-style",
+      state={},
+  )
+
+  url = f"/apps/{test_session_info['app_name']}/users/{test_session_info['user_id']}/sessions"
+  response = test_app.get(url)
+
+  assert response.status_code == 200
+  data = response.json()
+  assert isinstance(data, list)
+
+  session_ids = [session["id"] for session in data]
+  assert "normal-session" in session_ids
+  assert "adk-eval-session-new-style" not in session_ids
+  assert "___eval___session___old-style" not in session_ids
+
+
 def test_delete_session(test_app, create_test_session):
   """Test deleting a session."""
   info = create_test_session
@@ -3171,30 +3250,32 @@ def test_list_metrics_info(builder_test_client):
     assert "metricValueInfo" in metric
 
 
-def test_list_metrics_info_omits_metrics_that_need_no_threshold(
+def test_list_metrics_info_includes_metrics_that_need_no_threshold(
     builder_test_client,
 ):
-  """Always-on informational metrics are not offered for threshold selection.
+  """Informational metrics are listed too, flagged as needing no threshold.
 
-  This surface asks the user to pick metrics and set a threshold for each, and
-  bounds the threshold control by the metric's value interval. Metrics that
-  need no threshold have neither, so listing them leaves consumers with nothing
-  to render.
+  A caller that asks the user to pick metrics and set a threshold for each
+  filters on `requiresThreshold`; a caller that only describes metrics, such
+  as the Dev UI's result tooltips, needs every registered metric present.
   """
   response = builder_test_client.get("/dev/apps/test_app/metrics-info")
 
   assert response.status_code == 200
-  listed = [metric["metricName"] for metric in response.json()["metricsInfo"]]
-  assert "tool_trajectory_avg_score" in listed
+  by_name = {
+      metric["metricName"]: metric for metric in response.json()["metricsInfo"]
+  }
+  assert by_name["tool_trajectory_avg_score"]["requiresThreshold"] is True
   for informational in (
       "tool_call_count_v1",
       "inference_call_count_v1",
       "token_usage_v1",
+      "invocation_duration_v1",
   ):
-    assert informational not in listed
-  # Everything that is listed can be rendered as a bounded threshold control.
-  for metric in response.json()["metricsInfo"]:
-    assert metric["metricValueInfo"]["interval"]
+    assert by_name[informational]["requiresThreshold"] is False
+    # Nothing bounds an informational value, so a threshold control has no
+    # interval to size itself by. That is why the caller filters instead.
+    assert "interval" not in by_name[informational]["metricValueInfo"]
 
 
 def test_debug_trace(test_app):

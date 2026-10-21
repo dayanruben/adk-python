@@ -32,6 +32,7 @@ from pydantic import ValidationError
 
 from ..agents.base_agent import BaseAgent
 from ..agents.context import _derive_node_path
+from ..events._branch_path import _BranchPath
 from ..events._node_path_builder import _NodePathBuilder
 from ..utils._agent_mode import AgentMode
 from ..utils._agent_mode import DefaultLlmNodeMode
@@ -67,6 +68,12 @@ class DynamicNodeRun:
 
   output: Any = None
   """The final output of the node once it completes."""
+
+  route: Any = None
+  """The route selected by the node once it completes."""
+
+  branch: str | None = None
+  """The branch of the node once it completes."""
 
   task: asyncio.Task[Context] | None = None
   """The running asyncio Task, or None for a run replayed from cache."""
@@ -210,10 +217,10 @@ class DynamicNodeScheduler:
 
     Args:
       state: The shared dynamic node state.
-      enable_replay: Whether to reconstruct prior runs from session events.
-        Set to False when the scheduler is installed only to drive sequential
-        agent transfers, so scheduling stays a direct pass-through to
-        NodeRunner without session event scanning.
+      enable_replay: Whether to reconstruct prior runs from session events. Set
+        to False when the scheduler is installed only to drive sequential agent
+        transfers, so scheduling stays a direct pass-through to NodeRunner
+        without session event scanning.
     """
     self._state = state
     self._replay_manager = state.replay_manager
@@ -364,7 +371,8 @@ class DynamicNodeScheduler:
     In workflow mode (enable_replay=True):
       - Allocates auto-incrementing sequential run IDs (_state.next_run_id).
       - Rehydrates and deduplicates executions from session events.
-      - Sets up chronological sequence barriers and registers runs in _state.runs.
+      - Sets up chronological sequence barriers and registers runs in
+      _state.runs.
 
     In standalone mode (enable_replay=False):
       - Defaults run_id to '1' to keep node paths stable across repeat runs.
@@ -521,6 +529,7 @@ class DynamicNodeScheduler:
         )
         # Sync output and transfer decisions with the current run state.
         run.output = result.output
+        run.route = result.route
         run.transfer_to_agent = result.transfer_to_agent
 
       if run.is_static:
@@ -535,6 +544,18 @@ class DynamicNodeScheduler:
         )
       else:
         ancestors = []
+      base_branch = (
+          override_branch
+          if override_branch is not None
+          else curr_parent_ctx._invocation_context.branch
+      )
+      scheduled_branch = (
+          _BranchPath.create_sub_branch(
+              base_branch, name=curr_name, run_id=curr_run_id
+          )
+          if use_sub_branch
+          else base_branch
+      )
       mock_ctx = create_mock_context(
           parent_ctx=curr_parent_ctx,
           node=curr_node,
@@ -542,7 +563,11 @@ class DynamicNodeScheduler:
           result=result,
           ancestors=ancestors,
           node_path=node_path,
-          branch=(run.recovered_state.branch if run.recovered_state else None),
+          branch=(
+              run.branch
+              or (run.recovered_state.branch if run.recovered_state else None)
+              or scheduled_branch
+          ),
       )
 
       # Chronological sequence barrier wait for replayed dynamic nodes
@@ -701,6 +726,8 @@ class DynamicNodeScheduler:
   ) -> None:
     """Update dynamic node state after execution."""
     state = run.state
+    run.route = child_ctx.route
+    run.branch = child_ctx.branch
     if child_ctx.error:
       state.status = NodeStatus.FAILED
     elif child_ctx.interrupt_ids:

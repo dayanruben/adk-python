@@ -44,6 +44,8 @@ logger = logging.getLogger("google_adk." + __name__)
 
 
 def _has_non_output_content(event: Event) -> bool:
+  if event.content is not None or event.error_code or event.error_message:
+    return True
   if event.actions:
     if (
         event.actions.state_delta
@@ -419,12 +421,10 @@ class NodeRunner:
         await self._run_node_loop_with_timeout(ctx, node_input, timeout)
       else:
         await self._run_node_loop(ctx, node_input)
-    except NodeInterruptedError:
+    except NodeInterruptedError as exc:
       # A dynamic child interrupted via ctx.run_node().
-      # The child's interrupt_ids are already on ctx
-      # (set by the schedule callback). Nothing more to do —
-      # the caller reads ctx.interrupt_ids.
-      pass
+      # Tool calls have their own Context, so copy their interrupt IDs too.
+      ctx._interrupt_ids.update(exc.interrupt_ids)
 
   async def _run_node_loop(self, ctx: Context, node_input: Any) -> None:
     """Iterate node.run(), track events in context, and enqueue them."""
@@ -495,7 +495,9 @@ class NodeRunner:
     if event.output is not None and ctx._output_delegated:
       if not _has_non_output_content(event):
         return
-      event = event.model_copy(update={"output": None})
+      # Rehydration reads an error code without an output as a failed node.
+      if event.error_code is None:
+        event = event.model_copy(update={"output": None})
 
     self._enrich_event(event, ctx)
     if not event.partial:

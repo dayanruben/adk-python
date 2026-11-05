@@ -12890,9 +12890,11 @@ class _EvalViewSqlEvaluator:
     ``[SAFE_OFFSET(n)]``, CAST to INT64 or JSON, SAFE_CAST, and
     ``(SELECT ...)``, ``EXISTS(SELECT ...)`` and ``ARRAY(SELECT ...)`` over
     ``UNNEST``.
-  - The aggregates in ``_aggregate``, also over ``OVER (PARTITION BY ...)``;
-    ROW_NUMBER, LAG and LEAD over ``OVER (PARTITION BY ... ORDER BY ...)``;
-    and the scalar functions in ``_call``.
+  - The aggregates in ``_aggregate``, also over ``OVER (PARTITION BY ...)``,
+    or, with ``ORDER BY ...``, over the frame
+    ``ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW``; ROW_NUMBER, LAG and
+    LEAD over ``OVER (PARTITION BY ... ORDER BY ...)``; and the scalar
+    functions in ``_call``.
 
   SQL NULL is ``None``, and JSON values are Python dicts, lists and scalars.
   A JSON function reads a field of a ``str`` by parsing it as JSON text, as
@@ -13219,8 +13221,11 @@ class _EvalViewSqlEvaluator:
       if self._accept("PARTITION", "BY"):
         partition_by = self._parse_exprs()
       order_by = self._parse_order_by() if self._accept("ORDER", "BY") else []
+      running = self._accept(
+          "ROWS", "BETWEEN", "UNBOUNDED", "PRECEDING", "AND", "CURRENT", "ROW"
+      )
       self._expect(")")
-      return ("window", node, partition_by, order_by)
+      return ("window", node, partition_by, order_by, running)
     return node
 
   @classmethod
@@ -13442,8 +13447,12 @@ class _EvalViewSqlEvaluator:
         "SUM": sum,
     }[name](values)
 
-  def _window(self, row, rows, function, partition_by, order_by):
-    """Evaluates ``function`` over ``row``'s window partition of ``rows``."""
+  def _window(self, row, rows, function, partition_by, order_by, running):
+    """Evaluates ``function`` over ``row``'s window partition of ``rows``.
+
+    A ``running`` frame ends at ``row``; an aggregate without one reads the
+    whole partition.
+    """
     assert rows is not None, "A window function needs the input rows"
     key = [self._eval(node, row, None) for node in partition_by]
     partition = self._sorted(
@@ -13454,11 +13463,13 @@ class _EvalViewSqlEvaluator:
         ],
         order_by,
     )
-    if function[0] == "aggregate":
-      assert not order_by, "Only whole-partition aggregate frames are supported"
-      return self._aggregate(partition, *function[1:])
-    name, call_args = function[1:]
     index = next(i for i, other in enumerate(partition) if other is row)
+    if function[0] == "aggregate":
+      assert running or not order_by, "Unsupported aggregate window frame"
+      frame = partition[: index + 1] if running else partition
+      return self._aggregate(frame, *function[1:])
+    name, call_args = function[1:]
+    assert not running, f"{name} takes no window frame"
     if name == "ROW_NUMBER":
       return index + 1
     assert name in ("LAG", "LEAD"), f"Unsupported window function {name}"
@@ -13671,6 +13682,33 @@ class TestEvalViews:
         **columns,
     }
 
+  @staticmethod
+  def _finished_turn(
+      session_id: str, invocation_id: str, second: int, **reply_columns: Any
+  ) -> list[dict[str, Any]]:
+    """Returns the rows of a finished turn; the reply row has the columns."""
+    columns = {"session_id": session_id}
+    return [
+        TestEvalViews._event(
+            invocation_id,
+            second,
+            "USER_MESSAGE_RECEIVED",
+            {"text_summary": "Hi"},
+            **columns,
+        ),
+        TestEvalViews._event(
+            invocation_id,
+            second + 1,
+            "AGENT_RESPONSE",
+            {"response": "text: 'Done.'"},
+            **columns,
+            **reply_columns,
+        ),
+        TestEvalViews._event(
+            invocation_id, second + 2, "INVOCATION_COMPLETED", **columns
+        ),
+    ]
+
   def test_config_create_eval_views_default_false(self):
     """Eval views are opt-in, so default setup only creates analytics views."""
     config = bigquery_agent_analytics_plugin.BigQueryLoggerConfig()
@@ -13879,6 +13917,7 @@ class TestEvalViews:
         "LLM_REQUEST",
         "TOOL_STARTING",
         "TOOL_COMPLETED",
+        "TOOL_ERROR",
         "AGENT_TRANSFER",
         "AGENT_RESPONSE",
         "INVOCATION_COMPLETED",
@@ -13921,9 +13960,10 @@ class TestEvalViews:
       )
 
     # The trace carries a multi-agent handoff only as the AGENT_TRANSFER
-    # function_call, and a HITL pause and resumption only as the pause rows,
-    # so an allowlist without either is rejected too.
-    for missing_events in ({"AGENT_TRANSFER"}, pause_events):
+    # function_call, the response of a tool that raised only as TOOL_ERROR,
+    # and a HITL pause and resumption only as the pause rows, so an allowlist
+    # without any of them is rejected too.
+    for missing_events in ({"AGENT_TRANSFER"}, {"TOOL_ERROR"}, pause_events):
       with pytest.raises(
           ValueError, match=re.escape(f"missing: {sorted(missing_events)}.")
       ):
@@ -14118,26 +14158,46 @@ class TestEvalViews:
     """Guardrail columns follow the per-turn rules and roll up per session."""
     session_sql, turn_sql = self._normalized_view_sql()
     for sql in (session_sql, turn_sql):
+      # Tool metrics skip transfer_to_agent (AGENT_TRANSFER is the handoff)
+      # and the pseudo-tools that pause for a credential, a confirmation or
+      # the user's input, so a tool added to _HITL_EVENT_MAP must join them.
+      (framework_tools,) = re.findall(
+          r"COALESCE\(JSON_VALUE\(content, '\$\.tool'\), ''\) IN \(([^)]*)\)"
+          r" AS is_framework_tool",
+          sql,
+      )
+      assert set(re.findall(r"'(\w+)'", framework_tools)) == {
+          *bigquery_agent_analytics_plugin._HITL_EVENT_MAP,
+          "transfer_to_agent",
+      }
       for fragment in (
-          # Tool metrics skip transfer_to_agent; AGENT_TRANSFER is the handoff.
+          # A TOOL_STARTING row that names no tool is not a tool call.
           (
-              "( event_type = 'TOOL_STARTING' AND COALESCE(tool_name, '') !="
-              " 'transfer_to_agent' ) AS is_tool_call"
+              "( event_type = 'TOOL_STARTING' AND NULLIF(tool_name, '') IS NOT"
+              " NULL AND NOT is_framework_tool ) AS is_tool_call"
           ),
           "COUNTIF(is_tool_call) AS tool_call_count",
-          "IF(is_tool_call, NULLIF(tool_name, ''), NULL) AS invoked_tool_name",
+          "IF(is_tool_call, tool_name, NULL) AS invoked_tool_name",
           (
               "ARRAY_AGG( DISTINCT invoked_tool_name IGNORE NULLS ORDER BY"
               " invoked_tool_name ), ARRAY<STRING>[] ) AS distinct_tools_used"
           ),
-          # Calls in a row with the same name and args share an island.
+          # Consecutive calls with the same name and args share an island,
+          # unless a HITL request comes between them.
           "TO_JSON_STRING(JSON_QUERY(content, '$.args')) AS tool_args_json",
+          (
+              "COUNTIF( event_type IN ( 'HITL_CREDENTIAL_REQUEST',"
+              " 'HITL_CONFIRMATION_REQUEST', 'HITL_INPUT_REQUEST' ) ) OVER ("
+              " PARTITION BY session_id, invocation_id ORDER BY timestamp,"
+              " event_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW ) AS"
+              " hitl_request_count"
+          ),
           (
               "ROW_NUMBER() OVER ( PARTITION BY session_id, invocation_id,"
               " is_tool_call ORDER BY timestamp, event_id ) - ROW_NUMBER()"
               " OVER ( PARTITION BY session_id, invocation_id, is_tool_call,"
-              " tool_name, tool_args_json ORDER BY timestamp, event_id ) AS"
-              " tool_call_island"
+              " tool_name, tool_args_json, hitl_request_count ORDER BY"
+              " timestamp, event_id ) AS tool_call_island"
           ),
           (
               "COUNT(*) OVER ( PARTITION BY session_id, invocation_id,"
@@ -14150,7 +14210,13 @@ class TestEvalViews:
           ),
           "COUNTIF(event_type = 'LLM_ERROR') AS llm_error_count",
           "COUNTIF(event_type = 'AGENT_ERROR') AS agent_error_count",
-          "LOGICAL_OR(COALESCE(is_truncated, FALSE)) AS has_truncated_content",
+          # Only a row that puts an event in the trace can mark its turn
+          # truncated, so an LLM_REQUEST row, which repeats the conversation,
+          # cannot hold back a later turn.
+          (
+              "LOGICAL_OR(event_content IS NOT NULL AND COALESCE(is_truncated,"
+              " FALSE)) AS has_truncated_content"
+          ),
           # Token totals count terminal LLM_RESPONSE rows when the turn has
           # any, so streamed usage is not counted twice.
           "JSON_VALUE(content, '$.usage.prompt') AS INT64) AS usage_prompt",
@@ -14663,6 +14729,7 @@ class TestEvalViews:
     # Free-form payloads inside FunctionCall.args and FunctionResponse.response.
     freeform_payload_key_tuples = {
         ("agent_name",),
+        ("error",),
         ("result",),
     }
 
@@ -15056,10 +15123,10 @@ class TestEvalViews:
         "inv-4": False,
         "inv-5": False,
     }
-    # request_input is a tool the model called, so tool metrics count it.
-    assert session_row["tool_call_count"] == 4
+    # request_input pauses the turn for the user's input, as the framework's
+    # HITL calls do, so tool metrics skip it.
+    assert session_row["tool_call_count"] == 3
     assert session_row["distinct_tools_used"] == [
-        "adk_request_input",
         "cancel_order",
         "lookup_order",
     ]
@@ -15515,6 +15582,779 @@ class TestEvalViews:
     assert session_rows["s-conv-only"]["trace"]["turns"][0]["events"][1][
         "content"
     ]["parts"] == [{"text": "Fast-path answer."}]
+
+  def test_eval_tool_error_is_a_function_response_after_its_call(self) -> None:
+    """A TOOL_ERROR answers its function_call with the error message."""
+    session_view, turn_view = self._eval_views()
+    event = self._event
+    call = {"tool": "lookup", "args": {"id": 1}, "tool_origin": "LOCAL"}
+    rows = [
+        event("inv-1", 0, "USER_MESSAGE_RECEIVED", {"text_summary": "Hi"}),
+        # The next three rows share a timestamp and the reply's event_id sorts
+        # first, so only event_seq puts the call, its error and the reply in
+        # that order.
+        event("inv-1", 1, "TOOL_STARTING", call, event_id="b-call"),
+        event(
+            "inv-1",
+            1,
+            "TOOL_ERROR",
+            call,
+            event_id="c-error",
+            status="ERROR",
+            error_message="Order 42 not found.",
+        ),
+        event(
+            "inv-1",
+            1,
+            "AGENT_RESPONSE",
+            {"response": "text: 'Sorry.'"},
+            event_id="a-reply",
+        ),
+        event("inv-1", 2, "INVOCATION_COMPLETED"),
+    ]
+
+    (turn_row,) = turn_view.run(rows)
+    (session_row,) = session_view.run(rows)
+
+    for row in (turn_row, session_row):
+      trace_parts = [
+          e["content"]["parts"] for e in row["trace"]["turns"][0]["events"]
+      ]
+      assert trace_parts == [
+          [{"text": "Hi"}],
+          [{"function_call": {"name": "lookup", "args": {"id": 1}}}],
+          [{
+              "function_response": {
+                  "name": "lookup",
+                  "response": {"error": "Order 42 not found."},
+              }
+          }],
+          [{"text": "Sorry."}],
+      ]
+      assert (row["tool_call_count"], row["tool_error_count"]) == (1, 1)
+      assert row["has_error"] is True
+
+  @pytest.mark.parametrize("error_message", [None, ""])
+  def test_eval_tool_error_without_a_message_reports_a_default_error(
+      self, error_message: str | None
+  ) -> None:
+    """A TOOL_ERROR with no message still answers its call with an error."""
+    _, turn_view = self._eval_views()
+    event = self._event
+    call = {"tool": "lookup", "args": {}}
+    rows = [
+        event("inv-1", 0, "USER_MESSAGE_RECEIVED", {"text_summary": "Hi"}),
+        event("inv-1", 1, "TOOL_STARTING", call),
+        event(
+            "inv-1",
+            2,
+            "TOOL_ERROR",
+            call,
+            status="ERROR",
+            error_message=error_message,
+        ),
+        event("inv-1", 3, "INVOCATION_COMPLETED"),
+    ]
+
+    (row,) = turn_view.run(rows)
+
+    response_event = row["trace"]["turns"][0]["events"][2]
+    assert response_event["content"]["parts"] == [{
+        "function_response": {
+            "name": "lookup",
+            "response": {"error": "Tool execution failed"},
+        }
+    }]
+
+  @pytest.mark.parametrize("content", [None, {"tool": "", "args": {}}])
+  def test_eval_tool_rows_without_a_tool_name_add_no_trace_event(
+      self, content: dict[str, Any] | None
+  ) -> None:
+    """A tool row that names no tool adds no event to the trace.
+
+    A custom content_formatter that fails leaves a row without its tool's
+    name, so the trace could not pair the call with its response.  Such a
+    TOOL_STARTING is not a tool call, but such a TOOL_ERROR still counts as a
+    tool error, and the turn still has an error.
+    """
+    session_view, turn_view = self._eval_views()
+    event = self._event
+    rows = [
+        event("inv-1", 0, "USER_MESSAGE_RECEIVED", {"text_summary": "Hi"}),
+        event("inv-1", 1, "TOOL_STARTING", content),
+        event("inv-1", 2, "TOOL_COMPLETED", content),
+        event("inv-1", 3, "TOOL_STARTING", content),
+        event(
+            "inv-1",
+            4,
+            "TOOL_ERROR",
+            content,
+            status="ERROR",
+            error_message="boom",
+        ),
+        event("inv-1", 5, "INVOCATION_COMPLETED"),
+    ]
+
+    (turn_row,) = turn_view.run(rows)
+    (session_row,) = session_view.run(rows)
+
+    for row in (turn_row, session_row):
+      trace_parts = [
+          e["content"]["parts"] for e in row["trace"]["turns"][0]["events"]
+      ]
+      assert trace_parts == [[{"text": "Hi"}]]
+      assert row["has_error"] is True
+      assert (row["tool_call_count"], row["tool_error_count"]) == (0, 1)
+      assert row["distinct_tools_used"] == []
+      assert row["max_consecutive_identical_tool_calls"] == 0
+
+  @pytest.mark.parametrize(
+      "failed_attempts, has_tool_loop", [(1, False), (2, True)]
+  )
+  def test_eval_tool_retries_pair_each_call_with_its_error_or_result(
+      self, failed_attempts: int, has_tool_loop: bool
+  ) -> None:
+    """A retried call is one function_call and one response per attempt.
+
+    Identical attempts count as consecutive identical calls whether or not an
+    error separates them, so the third attempt makes a tool loop.
+    """
+    session_view, turn_view = self._eval_views()
+    event = self._event
+    call = {"tool": "lookup", "args": {"id": 1}}
+    function_call = [{"function_call": {"name": "lookup", "args": {"id": 1}}}]
+    rows = [event("inv-1", 0, "USER_MESSAGE_RECEIVED", {"text_summary": "Hi"})]
+    expected_parts = [[{"text": "Hi"}]]
+    for attempt in range(1, failed_attempts + 1):
+      message = f"Attempt {attempt} failed."
+      rows += [
+          event("inv-1", 2 * attempt - 1, "TOOL_STARTING", call),
+          event(
+              "inv-1",
+              2 * attempt,
+              "TOOL_ERROR",
+              call,
+              status="ERROR",
+              error_message=message,
+          ),
+      ]
+      expected_parts += [
+          function_call,
+          [{
+              "function_response": {
+                  "name": "lookup",
+                  "response": {"error": message},
+              }
+          }],
+      ]
+    last = 2 * failed_attempts + 1
+    rows += [
+        event("inv-1", last, "TOOL_STARTING", call),
+        event(
+            "inv-1",
+            last + 1,
+            "TOOL_COMPLETED",
+            {**call, "result": {"found": True}},
+        ),
+        event(
+            "inv-1",
+            last + 2,
+            "AGENT_RESPONSE",
+            {"response": "text: 'Found it.'"},
+        ),
+        event("inv-1", last + 3, "INVOCATION_COMPLETED"),
+    ]
+    expected_parts += [
+        function_call,
+        [{
+            "function_response": {
+                "name": "lookup",
+                "response": {"found": True},
+            }
+        }],
+        [{"text": "Found it."}],
+    ]
+
+    (turn_row,) = turn_view.run(rows)
+    (session_row,) = session_view.run(rows)
+
+    trace_parts = [
+        e["content"]["parts"] for e in turn_row["trace"]["turns"][0]["events"]
+    ]
+    assert trace_parts == expected_parts
+    for row in (turn_row, session_row):
+      assert row["tool_call_count"] == failed_attempts + 1
+      assert row["tool_error_count"] == failed_attempts
+      assert row["max_consecutive_identical_tool_calls"] == failed_attempts + 1
+      assert row["has_tool_loop"] is has_tool_loop
+
+  def test_eval_parallel_tool_calls_come_before_their_responses(self) -> None:
+    """Calls that start together all precede their results and errors.
+
+    The model's function_calls form one message and the responses follow it, so
+    the error of one call does not fall between the calls, even though its
+    event_id sorts before the other call's.
+    """
+    _, turn_view = self._eval_views()
+    event = self._event
+    rows = [
+        event("inv-1", 0, "USER_MESSAGE_RECEIVED", {"text_summary": "Hi"}),
+        # The next four rows share a timestamp.
+        event(
+            "inv-1",
+            1,
+            "TOOL_STARTING",
+            {"tool": "lookup_a", "args": {}},
+            event_id="a-call",
+        ),
+        event(
+            "inv-1",
+            1,
+            "TOOL_ERROR",
+            {"tool": "lookup_a", "args": {}},
+            event_id="a-error",
+            status="ERROR",
+            error_message="A failed.",
+        ),
+        event(
+            "inv-1",
+            1,
+            "TOOL_STARTING",
+            {"tool": "lookup_b", "args": {}},
+            event_id="b-call",
+        ),
+        event(
+            "inv-1",
+            1,
+            "TOOL_COMPLETED",
+            {"tool": "lookup_b", "result": {"ok": True}},
+            event_id="b-done",
+        ),
+        event("inv-1", 2, "INVOCATION_COMPLETED"),
+    ]
+
+    (row,) = turn_view.run(rows)
+
+    # Skips the user message, which has a text part.
+    steps = []
+    for e in row["trace"]["turns"][0]["events"][1:]:
+      for part in e["content"]["parts"]:
+        steps.extend((kind, part[kind]["name"]) for kind in part)
+    assert steps == [
+        ("function_call", "lookup_a"),
+        ("function_call", "lookup_b"),
+        ("function_response", "lookup_a"),
+        ("function_response", "lookup_b"),
+    ]
+    assert (row["tool_call_count"], row["tool_error_count"]) == (2, 1)
+
+  @pytest.mark.parametrize(
+      "tool",
+      [
+          "transfer_to_agent",
+          "adk_request_credential",
+          "adk_request_confirmation",
+          "adk_request_input",
+      ],
+  )
+  def test_eval_tool_error_of_a_framework_tool_adds_no_trace_event(
+      self, tool: str
+  ) -> None:
+    """A framework tool's TOOL_ERROR adds no function_response.
+
+    The handoff and the HITL requests reach the trace as AGENT_TRANSFER and
+    HITL_* rows, so a function_response for their TOOL_ERROR would answer no
+    function_call.  Tool metrics skip it too, though the turn has an error.
+    """
+    _, turn_view = self._eval_views()
+    event = self._event
+    rows = [
+        event("inv-1", 0, "USER_MESSAGE_RECEIVED", {"text_summary": "Hi"}),
+        event(
+            "inv-1",
+            1,
+            "TOOL_ERROR",
+            {"tool": tool, "args": {}},
+            status="ERROR",
+            error_message="failed",
+        ),
+        event("inv-1", 2, "AGENT_RESPONSE", {"response": "text: 'Done.'"}),
+        event("inv-1", 3, "INVOCATION_COMPLETED"),
+    ]
+
+    (row,) = turn_view.run(rows)
+
+    trace_parts = [
+        e["content"]["parts"] for e in row["trace"]["turns"][0]["events"]
+    ]
+    assert trace_parts == [[{"text": "Hi"}], [{"text": "Done."}]]
+    assert (row["tool_call_count"], row["tool_error_count"]) == (0, 0)
+    assert row["has_error"] is True
+
+  def test_eval_hitl_request_tools_are_not_tool_calls(self) -> None:
+    """Tool metrics skip the pseudo-tools that pause the turn for the user.
+
+    adk_request_credential, adk_request_confirmation and adk_request_input
+    pause for a credential, a confirmation or the user's input, so repeating
+    them is not a tool loop.  Any other tool still counts.
+    """
+    session_view, turn_view = self._eval_views()
+    event = self._event
+
+    def turn(
+        invocation_id: str, second: int, tool: str
+    ) -> list[dict[str, Any]]:
+      """Returns a turn that calls ``tool`` three times with the same args."""
+      return [
+          event(
+              invocation_id,
+              second,
+              "USER_MESSAGE_RECEIVED",
+              {"text_summary": "Hi"},
+          ),
+          *(
+              event(
+                  invocation_id,
+                  second + n,
+                  "TOOL_STARTING",
+                  {"tool": tool, "args": {}},
+              )
+              for n in (1, 2, 3)
+          ),
+          event(invocation_id, second + 4, "INVOCATION_COMPLETED"),
+      ]
+
+    rows = [
+        *turn("inv-credential", 0, "adk_request_credential"),
+        *turn("inv-confirmation", 10, "adk_request_confirmation"),
+        *turn("inv-input", 20, "adk_request_input"),
+        *turn("inv-lookup", 30, "lookup"),
+    ]
+
+    metrics = {
+        row["invocation_id"]: (
+            row["tool_call_count"],
+            row["distinct_tools_used"],
+            row["max_consecutive_identical_tool_calls"],
+            row["has_tool_loop"],
+        )
+        for row in turn_view.run(rows)
+    }
+    assert metrics == {
+        "inv-credential": (0, [], 0, False),
+        "inv-confirmation": (0, [], 0, False),
+        "inv-input": (0, [], 0, False),
+        "inv-lookup": (3, ["lookup"], 3, True),
+    }
+    (session_row,) = session_view.run(rows)
+    assert session_row["tool_call_count"] == 3
+    assert session_row["distinct_tools_used"] == ["lookup"]
+
+  def test_eval_hitl_requests_end_runs_of_identical_tool_calls(self) -> None:
+    """A HITL request between identical tool calls ends their run.
+
+    A turn that resumes after a HITL request keeps its invocation_id, so
+    calling a tool again once the user has answered would otherwise look like
+    a tool loop.
+    """
+    _, turn_view = self._eval_views()
+    event = self._event
+    call = {"tool": "lookup", "args": {"id": 1}}
+
+    def turn(
+        invocation_id: str, second: int, tool: str | None
+    ) -> list[dict[str, Any]]:
+      """Returns a turn that calls lookup three times, pausing for ``tool``."""
+      rows = [
+          event(
+              invocation_id,
+              second,
+              "USER_MESSAGE_RECEIVED",
+              {"text_summary": "Hi"},
+          ),
+          event(invocation_id, second + 1, "TOOL_STARTING", call),
+      ]
+      for n in (2, 5):
+        if tool:
+          request = bigquery_agent_analytics_plugin._HITL_EVENT_MAP[tool]
+          rows += [
+              event(
+                  invocation_id,
+                  second + n,
+                  request,
+                  {"tool": tool, "args": {}},
+              ),
+              event(
+                  invocation_id,
+                  second + n + 1,
+                  f"{request}_COMPLETED",
+                  {"tool": tool, "result": {}},
+              ),
+          ]
+        rows.append(event(invocation_id, second + n + 2, "TOOL_STARTING", call))
+      rows.append(event(invocation_id, second + 8, "INVOCATION_COMPLETED"))
+      return rows
+
+    rows = [
+        *turn("inv-no-pause", 0, None),
+        *turn("inv-credential", 10, "adk_request_credential"),
+        *turn("inv-confirmation", 20, "adk_request_confirmation"),
+        *turn("inv-input", 30, "adk_request_input"),
+    ]
+
+    metrics = {
+        row["invocation_id"]: (
+            row["tool_call_count"],
+            row["max_consecutive_identical_tool_calls"],
+            row["has_tool_loop"],
+        )
+        for row in turn_view.run(rows)
+    }
+    assert metrics == {
+        "inv-no-pause": (3, 3, True),
+        "inv-credential": (3, 1, False),
+        "inv-confirmation": (3, 1, False),
+        "inv-input": (3, 1, False),
+    }
+
+  def test_eval_repeated_input_requests_are_not_a_tool_loop(self) -> None:
+    """Three requests in a row for the user's input count as no tool call.
+
+    request_input logs TOOL_STARTING as well as the HITL_INPUT_REQUEST that
+    the trace shows, so a turn that asks the user the same question three
+    times would otherwise look like a loop of three identical tool calls.
+    """
+    session_view, turn_view = self._eval_views()
+    event = self._event
+    ask = {"tool": "adk_request_input", "args": {"message": "Which order?"}}
+    rows = [
+        event("inv-1", 0, "USER_MESSAGE_RECEIVED", {"text_summary": "Help."})
+    ]
+    for second in (1, 3, 5):
+      rows += [
+          event("inv-1", second, "TOOL_STARTING", ask),
+          event("inv-1", second + 1, "HITL_INPUT_REQUEST", ask),
+      ]
+    rows += [
+        event("inv-1", 7, "TOOL_PAUSED", ask),
+        event("inv-1", 8, "INVOCATION_COMPLETED"),
+    ]
+
+    (turn_row,) = turn_view.run(rows)
+    (session_row,) = session_view.run(rows)
+
+    for row in (turn_row, session_row):
+      assert row["tool_call_count"] == 0
+      assert row["distinct_tools_used"] == []
+      assert row["max_consecutive_identical_tool_calls"] == 0
+      assert row["has_tool_loop"] is False
+    # The trace still shows each request, once, as a function_call.
+    calls = []
+    for e in turn_row["trace"]["turns"][0]["events"]:
+      calls.extend(
+          part["function_call"]["name"]
+          for part in e["content"]["parts"]
+          if "function_call" in part
+      )
+    assert calls == ["adk_request_input"] * 3
+
+  def test_eval_truncated_turns_are_not_eval_ready(self) -> None:
+    """A row flagged is_truncated makes its turn and session not eval ready.
+
+    The other turns of the session stay ready.
+    """
+    session_view, turn_view = self._eval_views()
+    finished_turn = self._finished_turn
+    rows = [
+        *finished_turn("s-clean", "inv-clean", 0),
+        *finished_turn("s-flagged", "inv-flagged", 0, is_truncated=True),
+        *finished_turn("s-flagged", "inv-after-flagged", 10),
+    ]
+
+    turn_states = {
+        row["invocation_id"]: (row["has_truncated_content"], row["eval_ready"])
+        for row in turn_view.run(rows)
+    }
+    session_states = {
+        row["session_id"]: (row["has_truncated_content"], row["eval_ready"])
+        for row in session_view.run(rows)
+    }
+    assert turn_states == {
+        "inv-clean": (False, True),
+        "inv-flagged": (True, False),
+        "inv-after-flagged": (False, True),
+    }
+    # One truncated turn is enough to hold back the session.
+    assert session_states == {
+        "s-clean": (False, True),
+        "s-flagged": (True, False),
+    }
+
+  def test_eval_truncated_row_of_a_paused_session_is_not_eval_ready(
+      self,
+  ) -> None:
+    """A truncated row in a paused or resumed turn holds back its session.
+
+    A turn that paused for a HITL answer and the turn that resumes it count as
+    ready for their session, unless one of their rows is truncated.
+    """
+    session_view, turn_view = self._eval_views()
+    event = self._event
+    confirm = "adk_request_confirmation"
+    request = {"tool": confirm, "args": {}}
+    answer = {"tool": confirm, "result": {"confirmed": True}}
+
+    def paused_and_resumed(
+        session_id: str,
+        request_columns: dict[str, Any] | None = None,
+        answer_columns: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+      """Returns a turn paused for a confirmation, and the turn that resumes it.
+
+      Args:
+        session_id: The session of both turns.
+        request_columns: More columns of the paused turn's request row.
+        answer_columns: More columns of the resumed turn's answer row.
+      """
+      columns = {"session_id": session_id}
+      return [
+          event(
+              "inv-1",
+              0,
+              "USER_MESSAGE_RECEIVED",
+              {"text_summary": "Delete it."},
+              **columns,
+          ),
+          event(
+              "inv-1",
+              1,
+              "HITL_CONFIRMATION_REQUEST",
+              request,
+              **columns,
+              **(request_columns or {}),
+          ),
+          event("inv-1", 2, "TOOL_PAUSED", request, **columns),
+          event("inv-1", 3, "INVOCATION_COMPLETED", **columns),
+          event(
+              "inv-2",
+              10,
+              "USER_MESSAGE_RECEIVED",
+              {"text_summary": f"Function response: {confirm}"},
+              **columns,
+          ),
+          event(
+              "inv-2",
+              11,
+              "HITL_CONFIRMATION_REQUEST_COMPLETED",
+              answer,
+              **columns,
+              **(answer_columns or {}),
+          ),
+          event(
+              "inv-2",
+              12,
+              "AGENT_RESPONSE",
+              {"response": "text: 'Deleted.'"},
+              **columns,
+          ),
+          event("inv-2", 13, "INVOCATION_COMPLETED", **columns),
+      ]
+
+    rows = [
+        *paused_and_resumed("s-clean"),
+        *paused_and_resumed(
+            "s-request", request_columns={"is_truncated": True}
+        ),
+        *paused_and_resumed("s-answer", answer_columns={"is_truncated": True}),
+    ]
+
+    # (has_truncated_content, session_turn_eval_ready) of each turn.
+    assert {
+        (row["session_id"], row["invocation_id"]): (
+            row["has_truncated_content"],
+            row["session_turn_eval_ready"],
+        )
+        for row in turn_view.run(rows, cte="Turns")
+    } == {
+        ("s-clean", "inv-1"): (False, True),
+        ("s-clean", "inv-2"): (False, True),
+        ("s-request", "inv-1"): (True, False),
+        ("s-request", "inv-2"): (False, True),
+        ("s-answer", "inv-1"): (False, True),
+        ("s-answer", "inv-2"): (True, False),
+    }
+    assert {
+        row["session_id"]: (row["has_truncated_content"], row["eval_ready"])
+        for row in session_view.run(rows)
+    } == {
+        "s-clean": (False, True),
+        "s-request": (True, False),
+        "s-answer": (True, False),
+    }
+
+  def test_eval_truncated_llm_request_does_not_hold_back_later_turns(
+      self,
+  ) -> None:
+    """A later turn stays ready when only its LLM_REQUEST row is truncated.
+
+    An LLM_REQUEST row logs the conversation so far, so one oversized message
+    flags the request of every later turn, though the events that those turns
+    take from their own rows are whole.
+    """
+    session_view, turn_view = self._eval_views()
+    event = self._event
+
+    def turn(
+        session_id: str,
+        invocation_id: str,
+        second: int,
+        *,
+        user_truncated: bool = False,
+        request_truncated: bool = False,
+    ) -> list[dict[str, Any]]:
+      """Returns the rows of a finished turn that sent one LLM_REQUEST."""
+      columns = {"session_id": session_id}
+      return [
+          event(
+              invocation_id,
+              second,
+              "USER_MESSAGE_RECEIVED",
+              {"text_summary": "Hi"},
+              is_truncated=user_truncated,
+              **columns,
+          ),
+          event(
+              invocation_id,
+              second + 1,
+              "LLM_REQUEST",
+              {"system_prompt": "Be brief."},
+              is_truncated=request_truncated,
+              **columns,
+          ),
+          event(
+              invocation_id,
+              second + 2,
+              "AGENT_RESPONSE",
+              {"response": "text: 'Done.'"},
+              **columns,
+          ),
+          event(invocation_id, second + 3, "INVOCATION_COMPLETED", **columns),
+      ]
+
+    rows = [
+        # The first message is oversized, and every later request repeats it.
+        *turn(
+            "s-oversized",
+            "inv-1",
+            0,
+            user_truncated=True,
+            request_truncated=True,
+        ),
+        *turn("s-oversized", "inv-2", 10, request_truncated=True),
+        *turn("s-oversized", "inv-3", 20, request_truncated=True),
+        # Only a request is truncated.
+        *turn("s-request", "inv-1", 0, request_truncated=True),
+    ]
+
+    # (has_truncated_content, eval_ready) of each turn.
+    assert {
+        (row["session_id"], row["invocation_id"]): (
+            row["has_truncated_content"],
+            row["eval_ready"],
+        )
+        for row in turn_view.run(rows)
+    } == {
+        ("s-oversized", "inv-1"): (True, False),
+        ("s-oversized", "inv-2"): (False, True),
+        ("s-oversized", "inv-3"): (False, True),
+        ("s-request", "inv-1"): (False, True),
+    }
+    # The oversized message still holds back its own session.
+    assert {
+        row["session_id"]: (row["has_truncated_content"], row["eval_ready"])
+        for row in session_view.run(rows)
+    } == {
+        "s-oversized": (True, False),
+        "s-request": (False, True),
+    }
+
+  @pytest.mark.parametrize(
+      ("event_type", "content", "puts_event_in_trace"),
+      [
+          ("USER_MESSAGE_RECEIVED", {"text_summary": "More."}, True),
+          ("TOOL_STARTING", {"tool": "lookup", "args": {"q": "x"}}, True),
+          ("TOOL_COMPLETED", {"tool": "lookup", "result": {"n": 1}}, True),
+          ("TOOL_ERROR", {"tool": "lookup"}, True),
+          (
+              "AGENT_TRANSFER",
+              {"from_agent": "root_agent", "to_agent": "helper"},
+              True,
+          ),
+          ("AGENT_RESPONSE", {"response": "text: 'More.'"}, True),
+          ("LLM_REQUEST", {"system_prompt": "Be brief."}, False),
+          ("LLM_RESPONSE", {"response": "text: 'More.'"}, False),
+          ("AGENT_STARTING", {"text_summary": "Be brief."}, False),
+          # The trace shows a HITL row for a framework tool, not its own rows.
+          ("TOOL_STARTING", {"tool": "adk_request_input", "args": {}}, False),
+          # A tool row that names no tool puts no event in the trace.
+          ("TOOL_COMPLETED", {"result": {"n": 1}}, False),
+      ],
+      ids=[
+          "user_message",
+          "tool_call",
+          "tool_response",
+          "tool_error",
+          "agent_transfer",
+          "agent_response",
+          "llm_request",
+          "llm_response",
+          "agent_starting",
+          "framework_tool_call",
+          "unnamed_tool_response",
+      ],
+  )
+  def test_eval_truncated_row_counts_only_if_it_puts_an_event_in_the_trace(
+      self,
+      event_type: str,
+      content: dict[str, Any],
+      puts_event_in_trace: bool,
+  ) -> None:
+    """A truncated row counts only if it puts an event in the trace."""
+    session_view, turn_view = self._eval_views()
+    event = self._event
+    rows = [
+        event("inv-1", 0, "USER_MESSAGE_RECEIVED", {"text_summary": "Hi"}),
+        event("inv-1", 1, event_type, content, is_truncated=True),
+        event("inv-1", 2, "AGENT_RESPONSE", {"response": "text: 'Done.'"}),
+        event("inv-1", 3, "INVOCATION_COMPLETED"),
+    ]
+
+    # (has_truncated_content, eval_ready) of the one turn and session.
+    expected = (True, False) if puts_event_in_trace else (False, True)
+    for view in (turn_view, session_view):
+      assert [
+          (row["has_truncated_content"], row["eval_ready"])
+          for row in view.run(rows)
+      ] == [expected]
+
+  @pytest.mark.parametrize(
+      "build_view_sql",
+      [
+          bigquery_agent_analytics_plugin._build_eval_session_view_sql,
+          bigquery_agent_analytics_plugin._build_eval_turn_view_sql,
+      ],
+      ids=["session_view", "turn_view"],
+  )
+  def test_eval_views_reject_denying_is_truncated(
+      self, build_view_sql: Callable[..., str]
+  ) -> None:
+    """A protected is_truncated column cannot be projected out of the views.
+
+    Read as FALSE, a withheld is_truncated column would mark truncated turns
+    eval ready, so the builders fail closed.
+    """
+    with pytest.raises(ValueError, match=r"got \['is_truncated'\]"):
+      build_view_sql("p.d.t", denied_columns=frozenset({"is_truncated"}))
 
   def test_eval_view_ctes_end_without_a_newline(self) -> None:
     """The shared CTEs end at the closing paren, for the view templates."""

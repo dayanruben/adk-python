@@ -35,6 +35,7 @@ from pydantic import Field
 from pydantic import field_validator
 from pydantic import model_validator
 from pydantic import PrivateAttr
+from pydantic import ValidationInfo
 from typing_extensions import override
 from typing_extensions import TypeAlias
 
@@ -412,6 +413,12 @@ class LlmAgent(BaseAgent, abc.ABC):
   parallel_worker: bool | None = None
   """Whether to run the agent in parallel worker mode."""
 
+  max_parallel_workers: int | None = Field(default=None, ge=1)
+  """Maximum number of input items to run concurrently in parallel worker mode.
+
+  Requires parallel_worker=True. None means no limit on concurrency.
+  """
+
   # LLM-based agent transfer configs - Start
   disallow_transfer_to_parent: bool = False
   """Disallows LLM-controlled transferring to the parent agent.
@@ -518,10 +525,19 @@ class LlmAgent(BaseAgent, abc.ABC):
   When a list of callbacks is provided, the callbacks will be called in the
   order they are listed until a callback does not return None.
 
+  The callbacks are also called with an `asyncio.CancelledError` when an
+  in-flight model call is cancelled or its response stream is closed before a
+  completed response arrives, so that resources acquired in a before-model
+  callback can be released. A cancelled call is never recovered: all callbacks
+  in the list are called, any returned responses are ignored, the cancellation
+  propagates, and an exception raised by a callback is logged instead of
+  replacing the cancellation.
+
   Args:
     callback_context: CallbackContext,
     llm_request: LlmRequest, The raw model request.
-    error: The error from the model call.
+    error: The error from the model call, or the `asyncio.CancelledError` if
+      the model call was cancelled.
 
   Returns:
     Optional[LlmResponse]: A recovery response to use instead of propagating
@@ -1176,6 +1192,21 @@ class LlmAgent(BaseAgent, abc.ABC):
     accumulator += text
     event.actions.state_delta[self.output_key] = accumulator
     return accumulator
+
+  # A field validator, unlike a model 'after' validator, does not run on an
+  # LlmAgent instance passed as a field value, such as an autospec mock.
+  @field_validator('max_parallel_workers', mode='after')
+  @classmethod
+  def _validate_parallel_worker_config(
+      cls, max_parallel_workers: int | None, info: ValidationInfo
+  ) -> int | None:
+    if max_parallel_workers is not None and not info.data.get(
+        'parallel_worker'
+    ):
+      raise ValueError(
+          'max_parallel_workers can only be set when parallel_worker is True.'
+      )
+    return max_parallel_workers
 
   @model_validator(mode='before')
   @classmethod
